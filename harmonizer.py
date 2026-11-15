@@ -44,7 +44,7 @@ FIRMS_SOURCES = [
 ]
 
 FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
-FIRMS_MAX_DAY_RANGE = 10  # Area API tek istekte en fazla 10 gün kabul eder
+FIRMS_MAX_DAY_RANGE = 5  # NASA FIRMS Area API tek istekte en fazla 5 gün kabul eder [1..5]
 
 CONF_LEVELS = {"low": 0, "nominal": 1, "high": 2}
 CONF_NAMES = {v: k for k, v in CONF_LEVELS.items()}
@@ -118,8 +118,12 @@ class FIRMSClient:
 
     def _get(self, url: str) -> pd.DataFrame:
         req = urllib.request.Request(url, headers={"User-Agent": "KOZ-Atlas/1.0"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            err_msg = exc.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"HTTP {exc.code}: {err_msg[:200]}") from exc
         if not text.lstrip().lower().startswith("latitude"):
             raise RuntimeError(f"FIRMS yanıtı CSV değil: {text.strip()[:200]}")
         return pd.read_csv(io.StringIO(text))
@@ -282,43 +286,52 @@ def spatiotemporal_labels(df: pd.DataFrame, distance_km: float, window_min: floa
 
 
 def build_events(points: pd.DataFrame) -> pd.DataFrame:
-    """Kümelenmiş noktalardan Harmonize Yangın Olayı tablosu üretir."""
+    """Kümelenmiş noktalardan Harmonize Yangın Olayı tablosu üretir (vektörize ve optimize)."""
     p = points
     w = p["frp"].to_numpy() + 1e-6  # FRP=0 olan kümelerde eşit ağırlık
-    tmp = pd.DataFrame(
-        {
-            "event_idx": p["event_idx"].to_numpy(),
-            "w": w,
-            "wlat": w * p["latitude"].to_numpy(),
-            "wlon": w * p["longitude"].to_numpy(),
-            "is_modis": (p["instrument"] == "MODIS").to_numpy().astype(int),
-            "is_viirs": (p["instrument"] == "VIIRS").to_numpy().astype(int),
-        }
+    p_agg = p.assign(
+        _w=w,
+        _wlat=w * p["latitude"].to_numpy(),
+        _wlon=w * p["longitude"].to_numpy(),
+        _is_modis=(p["instrument"] == "MODIS").astype(int),
+        _is_viirs=(p["instrument"] == "VIIRS").astype(int),
     )
-    g = tmp.groupby("event_idx")
-    ev = pd.DataFrame(
-        {
-            "latitude": g["wlat"].sum() / g["w"].sum(),  # FRP ağırlıklı ağırlık merkezi
-            "longitude": g["wlon"].sum() / g["w"].sum(),
-            "n_modis": g["is_modis"].sum(),
-            "n_viirs": g["is_viirs"].sum(),
-        }
+    g = p_agg.groupby("event_idx", sort=False)
+    ev = g.agg(
+        _wlat=("_wlat", "sum"),
+        _wlon=("_wlon", "sum"),
+        _w=("_w", "sum"),
+        n_modis=("_is_modis", "sum"),
+        n_viirs=("_is_viirs", "sum"),
+        utc_timestamp=("utc_timestamp", "min"),
+        utc_end=("utc_timestamp", "max"),
+        frp_max_pixel=("frp", "max"),
+        conf_level=("conf_level", "max"),
+        brightness_max_k=("brightness_k", "max"),
+        daynight=("daynight", "first"),
     )
-    pg = p.groupby("event_idx")
-    ev["utc_timestamp"] = pg["utc_timestamp"].min()
-    ev["utc_end"] = pg["utc_timestamp"].max()
-    ev["frp_max_pixel"] = pg["frp"].max()
-    ev["conf_level"] = pg["conf_level"].max()
-    ev["brightness_max_k"] = pg["brightness_k"].max()
-    ev["satellites"] = pg["satellite"].agg(lambda s: ",".join(sorted(set(s))))
-    ev["daynight"] = pg["daynight"].first()
+    ev["latitude"] = ev["_wlat"] / ev["_w"]
+    ev["longitude"] = ev["_wlon"] / ev["_w"]
+    ev = ev.drop(columns=["_wlat", "_wlon", "_w"])
 
-    # Geçiş (uydu) bazında FRP toplamı, ardından sensör bazında geçişler arası ortalama:
-    # aynı pencereye düşen iki ayrı VIIRS uydusu geçişi aynı yangını iki kez toplamaz.
-    per_pass = p.groupby(["event_idx", "instrument", "satellite"])["frp"].sum()
-    per_sensor = per_pass.groupby(level=["event_idx", "instrument"]).mean().unstack("instrument")
-    for inst, col in (("MODIS", "frp_modis_mw"), ("VIIRS", "frp_viirs_mw")):
-        ev[col] = per_sensor[inst].reindex(ev.index).fillna(0.0) if inst in per_sensor else 0.0
+    # Hızlı uydu listesi: tek pikselli olaylar doğrudan aktarılır, çoklular birleştirilir
+    counts = p["event_idx"].value_counts()
+    singles = counts[counts == 1].index
+    multis = counts[counts > 1].index
+    sat_series = pd.Series(index=ev.index, dtype=object)
+
+    first_pts = p.drop_duplicates("event_idx").set_index("event_idx")
+    sat_series.loc[singles] = first_pts.loc[singles, "satellite"]
+    if len(multis):
+        multi_pts = p[p["event_idx"].isin(multis)][["event_idx", "satellite"]].drop_duplicates()
+        sat_series.loc[multis] = multi_pts.groupby("event_idx")["satellite"].agg(lambda s: ",".join(sorted(s)))
+    ev["satellites"] = sat_series
+
+    # Geçiş bazında FRP toplamı, ardından sensör bazında ortalama
+    per_pass = p.groupby(["event_idx", "instrument", "satellite"], as_index=False)["frp"].sum()
+    per_sensor = per_pass.groupby(["event_idx", "instrument"])["frp"].mean().unstack("instrument", fill_value=0.0)
+    ev["frp_modis_mw"] = per_sensor.get("MODIS", pd.Series(0.0, index=ev.index)).reindex(ev.index).fillna(0.0)
+    ev["frp_viirs_mw"] = per_sensor.get("VIIRS", pd.Series(0.0, index=ev.index)).reindex(ev.index).fillna(0.0)
 
     ev["merged_pixel_count"] = ev["n_modis"] + ev["n_viirs"]
     ev["sensor_label"] = np.select(
@@ -481,13 +494,17 @@ def detect_static_sources(
     months_best = np.zeros(len(events), dtype=int)
     for offset in (0.0, 0.5):
         key = _grid_keys(lat, lon, cell_km, offset)
-        g = pd.DataFrame({"key": key, "year": year, "day": day, "month": month})
-        nd = g.groupby(["key", "year"])["day"].transform("nunique").to_numpy()
-        nm = g.groupby(["key", "year"])["month"].transform("nunique").to_numpy()
-        cell_year_static = pd.Series((nd >= min_days) & (nm >= min_months))
-        flag |= cell_year_static.groupby(key).transform("max").to_numpy().astype(bool)
-        days_best = np.maximum(days_best, pd.Series(nd).groupby(key).transform("max").to_numpy())
-        months_best = np.maximum(months_best, pd.Series(nm).groupby(key).transform("max").to_numpy())
+        sub = pd.DataFrame({"key": key, "year": year, "day": day, "month": month})
+        stats = sub.groupby(["key", "year"]).agg(nd=("day", "nunique"), nm=("month", "nunique")).reset_index()
+        is_stat_year = (stats["nd"] >= min_days) & (stats["nm"] >= min_months)
+        stat_keys = set(stats.loc[is_stat_year, "key"])
+        key_max = stats.groupby("key").agg(nd=("nd", "max"), nm=("nm", "max"))
+        k_nd = key_max["nd"].to_dict()
+        k_nm = key_max["nm"].to_dict()
+
+        flag |= np.isin(key, list(stat_keys))
+        days_best = np.maximum(days_best, np.array([k_nd.get(k, 0) for k in key]))
+        months_best = np.maximum(months_best, np.array([k_nm.get(k, 0) for k in key]))
 
     is_static = pd.Series(flag, index=events.index)
     st = events.assign(persistence_days=days_best, persistence_months=months_best)[flag]

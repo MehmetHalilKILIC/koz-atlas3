@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import folium
 import numpy as np
@@ -34,7 +35,7 @@ BG, CARD, EMBER, AMBER = "#0B0F19", "#1E293B", "#FF5722", "#FF9800"
 C_MODIS, C_VIIRS, C_KOZ, C_STATIC = "#38BDF8", "#FACC15", "#FF5722", "#A855F7"
 MONTHS_TR = ["Oca", "Şub", "Mar", "Nis", "May", "Haz", "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara"]
 CONF_OPTIONS = {"low (tümü)": 0, "nominal": 1, "high": 2}
-MAP_LAYER_CAP = 3000
+MAP_LAYER_CAP = 800
 CUSTOM_AOI = "Özel Koordinat Kutusu"
 DARK_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
 SAT_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -93,8 +94,12 @@ def fmt_int(x) -> str:
 # ---------------------------------------------------------------------------
 # Veri yükleme (önbellekli)
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="Sentetik demo verisi üretiliyor…")
+@st.cache_data(show_spinner="Demo verisi yükleniyor…")
 def load_synthetic(y0: int, y1: int, seed: int = 42) -> pd.DataFrame:
+    p = Path(__file__).resolve().parent / "data" / "demo_firms.parquet"
+    if p.exists() and seed == 42:
+        df = pd.read_parquet(p)
+        return df[(df["acq_date"].dt.year >= y0) & (df["acq_date"].dt.year <= y1)].reset_index(drop=True)
     return hz.standardize_firms(hz.SyntheticFIRMSGenerator(seed=seed).generate(y0, y1))
 
 
@@ -149,12 +154,12 @@ with st.sidebar:
         std = load_synthetic(y0, y1)
     elif mode.startswith("Canlı"):
         map_key = st.text_input("FIRMS MAP_KEY", type="password", help="Ücretsiz anahtar: " + FIRMS_KEY_URL)
-        sources = st.multiselect("FIRMS kaynakları", hz.FIRMS_SOURCES, default=["MODIS_NRT", "VIIRS_SNPP_NRT"])
+        sources = st.multiselect("FIRMS kaynakları", hz.FIRMS_SOURCES, default=["MODIS_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"])
         today = date.today()
         rng_api = st.date_input("API tarih aralığı", (today - timedelta(days=9), today), max_value=today)
         d_api = rng_api if isinstance(rng_api, tuple) and len(rng_api) == 2 else (rng_api, rng_api)
         n_req = sum(len(hz.FIRMSClient("x").request_plan(s, bbox, d_api[0], d_api[1])) for s in sources)
-        st.caption(f"Plan: {n_req} istek (kaynak başına 10 günlük parçalar). NRT kaynakları yakın tarih, SP kaynakları arşiv içindir.")
+        st.caption(f"Plan: {n_req} istek (NASA Area API en fazla 5 günlük parçalar kabul eder). NRT kaynakları son günleri kapsar.")
         if st.button("Veriyi çek", type="primary", disabled=not (map_key and sources)):
             st.session_state["api_args"] = (map_key, tuple(sources), bbox, d_api[0], d_api[1])
         if "api_args" in st.session_state:
